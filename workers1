@@ -1,0 +1,127 @@
+import json
+import jieba
+import jieba.analyse
+from bs4 import BeautifulSoup
+import requests
+import redis
+import time
+import logging
+from pathlib import Path
+
+# 配置日志
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+
+class NewsSpiderWorker:
+    def __init__(self, worker_name, redis_host='192.168.43.111', redis_port=6379):
+        """ 初始化 Worker 连接 Redis """
+        self.worker_name = worker_name
+        self.task_queue = f'task_queue:{self.worker_name}'
+        self.worker_load_key = f'worker_load:{self.worker_name}'
+
+        # 连接 Redis，增加重试机制
+        for _ in range(5):  # 最多重试5次
+            try:
+                self.r = redis.Redis(host=redis_host, port=redis_port, db=0, decode_responses=True)
+                self.r.ping()  # 测试连接
+                logging.info("Redis 连接成功")
+                break
+            except redis.exceptions.ConnectionError as e:
+                logging.error(f"Redis 连接失败: {e}")
+                time.sleep(3)  # 等待后重试
+
+        self.headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                          'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36'
+        }
+
+    @staticmethod
+    def clean_html(html):
+        """解析 HTML 并提取正文"""
+        soup = BeautifulSoup(html, 'html.parser')
+        for script in soup(["script", "style"]):
+            script.extract()
+        text = ' '.join(soup.stripped_strings)
+        return text
+
+    @staticmethod
+    def extract_keywords(text, method='tfidf', top_k=10):
+        """使用 TF-IDF 或 TextRank 提取关键词"""
+        if method == 'tfidf':
+            keywords = jieba.analyse.extract_tags(text, topK=top_k, withWeight=True)
+        elif method == 'textrank':
+            keywords = jieba.analyse.textrank(text, topK=top_k, withWeight=True)
+        else:
+            raise ValueError("method 只能是 'tfidf' 或 'textrank'")
+        return [{"word": word, "weight": weight} for word, weight in keywords]
+
+    @staticmethod
+    def process_html(html, method='tfidf'):
+        """综合处理 HTML，提取正文并进行分词"""
+        clean_text = NewsSpiderWorker.clean_html(html)  # 清洗HTML
+        words = [word for word in jieba.cut(clean_text) if word.strip()]  # 过滤空字符
+        keywords = NewsSpiderWorker.extract_keywords(clean_text, method)  # 关键词提取
+
+        return {
+            "text": clean_text,
+            "words": words,
+            "keywords": keywords
+        }
+
+    def save_to_file(self, save_path, filename, data):
+        """将数据存储为 JSON 文档"""
+        save_path = Path("C:/Users/15933/PycharmProjects/pythonProject/项目/网易新闻抓取")
+        save_path.mkdir(parents=True, exist_ok=True)  # 确保路径存在
+
+        file_path = save_path / f"{filename}.json"
+        with open(file_path, "w", encoding='utf-8') as fp:
+            json.dump(data, fp, ensure_ascii=False, indent=4)
+        logging.info(f"数据已保存至 {file_path}")
+
+    def process_task(self):
+        """Worker 处理任务"""
+        while True:
+            task = self.r.blpop(self.task_queue, timeout=30)
+            if not task:
+                logging.info(f"{self.worker_name} 没有任务，等待中...")
+                time.sleep(5)
+                continue
+
+            _, url = task
+            logging.info(f"{self.worker_name} 正在处理: {url}")
+
+            try:
+                response = requests.get(url, headers=self.headers, timeout=10)
+                response.encoding = response.apparent_encoding
+
+                if response.status_code != 200:
+                    logging.warning(f"请求失败，状态码: {response.status_code}")
+                    continue
+
+                # 解析页面内容
+                analysis_result = self.process_html(response.text, method='textrank')
+
+                # 组织存储数据
+                data = {
+                    "url": url,
+                    **analysis_result
+                }
+
+                # 保存数据
+                save_path = Path("./data/news")
+                filename = url.split('/')[-1] or 'index'
+                self.save_to_file(save_path, filename, data)
+
+                logging.info(f"{self.worker_name} 任务完成: {url}")
+                self.r.decr(self.worker_load_key)
+
+            except requests.RequestException as e:
+                logging.error(f"请求失败: {e}")
+                self.r.rpush(self.task_queue, url)  # 任务失败，重新放回队列
+            except Exception as e:
+                logging.error(f"处理任务时发生错误: {e}")
+
+
+if __name__ == '__main__':
+    worker = NewsSpiderWorker(worker_name='worker1')
+    worker.process_task()
