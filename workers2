@@ -1,0 +1,98 @@
+import os
+import time
+import redis
+import requests
+import json
+import jieba
+import jieba.analyse
+from bs4 import BeautifulSoup
+from lxml import etree
+import re
+
+
+class NewsSpiderWorker:
+    def __init__(self, worker_name, redis_host='192.168.43.111', redis_port=6379):
+        """ 初始化 Worker 连接 Redis """
+        self.worker_name = worker_name
+        self.r = redis.Redis(host=redis_host, port=redis_port, db=0, decode_responses=True)
+        self.headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                          'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36'
+        }
+
+    @staticmethod
+    def clean_html(html):
+        """解析 HTML 并提取正文"""
+        soup = BeautifulSoup(html, 'html.parser')
+        for script in soup(["script", "style"]):
+            script.extract()
+        text = ' '.join(soup.stripped_strings)
+        return re.sub(r'[^\w\s]', '', text)
+
+    @staticmethod
+    def extract_keywords(text, method='tfidf', top_k=10):
+        """使用 TF-IDF 或 TextRank 提取关键词"""
+        if method == 'tfidf':
+            keywords = jieba.analyse.extract_tags(text, topK=top_k, withWeight=True)
+        elif method == 'textrank':
+            keywords = jieba.analyse.textrank(text, topK=top_k, withWeight=True)
+        else:
+            raise ValueError("method 只能是 'tfidf' 或 'textrank'")
+        return [{"word": word, "weight": weight} for word, weight in keywords]
+
+    @staticmethod
+    def get_new_page_info(page_content):
+        """解析具体新闻页面的文章列表"""
+        dom = etree.HTML(page_content)
+        titles = dom.xpath('//div[contains(@class, "data_row")]//a/text()')
+        urls = dom.xpath('//div[contains(@class, "data_row")]//a/@href')
+        return list(zip(titles, urls))
+
+    def save_to_file(self, save_path, filename, data):
+        """保存爬取的数据到本地文件"""
+        if not os.path.exists(save_path):
+            os.makedirs(save_path)
+        path = os.path.join(save_path, filename + ".txt")
+        with open(path, "w", encoding='utf-8') as fp:
+            for item in data:
+                fp.write(f"{item[0]}\t{item[1]}\n")
+
+    def process_task(self):
+        """Worker 处理任务"""
+        while True:
+            task = self.r.blpop(f'task_queue:{self.worker_name}', timeout=30)
+            if not task:
+                print(f"{self.worker_name} 没有任务，等待中...")
+                time.sleep(5)
+                continue
+
+            _, url = task
+            print(f"{self.worker_name} 正在处理: {url}")
+
+            try:
+                response = requests.get(url, headers=self.headers, timeout=10)
+                response.encoding = response.apparent_encoding
+            except requests.RequestException as e:
+                print(f"请求失败: {e}")
+                continue
+
+            # 解析页面内容
+            new_page_info = self.get_new_page_info(response.text)
+            clean_text = self.clean_html(response.text)
+            keywords = self.extract_keywords(clean_text, method='textrank')
+
+            # 保存数据
+            save_path = "C:/Users/15933/PycharmProjects/pythonProject/项目/网易新闻抓取"
+            filename = url.split('/')[-1] or 'index'
+            self.save_to_file(save_path, filename, new_page_info)
+
+            with open(os.path.join(save_path, filename + "_keywords.json"), "w", encoding='utf-8') as f:
+                json.dump(keywords, f, ensure_ascii=False, indent=4)
+
+            print(f"{self.worker_name} 任务完成: {url}")
+            self.r.decr(f'worker_load:{self.worker_name}')
+
+
+if __name__ == '__main__':
+    worker = NewsSpiderWorker(worker_name='worker2')
+    worker.process_task()
