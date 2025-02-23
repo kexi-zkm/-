@@ -1,5 +1,3 @@
-当然，以下是完整的可复制内容：
-markdown
 # 分布式爬虫系统
 
 ## 项目简介
@@ -20,9 +18,25 @@ markdown
 - **Redis**：作为任务队列，用于存储待处理的URL以及每个worker的任务状态。
 
 ## 目录结构
-/project │ ├── /workers # Worker代码目录 │ ├── worker.py # Worker的主要实现 │ ├── /src # 核心代码目录 │ ├── url_manager.py # URL管理器 │ ├── proxy_pool.py # 代理池 │ ├── dns_cache.py # DNS缓存 │ ├── task_distribute.py # 任务分发模块 │ ├── /data # 存储抓取的数据 │ └── output.json # 抓取数据的存储文件 ├── README.md # 项目的说明文件 └── requirements.txt # 依赖包列表
 
-bash
+为了帮助理解项目结构，以下是详细的目录树展示：
+
+```plaintext
+/project
+│
+├── /workers               # Worker代码目录
+│   ├── worker.py          # Worker的主要实现
+│
+├── /src                   # 核心代码目录
+│   ├── url_manager.py     # URL管理器
+│   ├── proxy_pool.py      # 代理池
+│   ├── dns_cache.py       # DNS缓存
+│   ├── task_distribute.py # 任务分发模块
+│
+├── /data                  # 存储抓取的数据
+│   └── output.json        # 抓取数据的存储文件
+├── README.md              # 项目的说明文件
+└── requirements.txt       # 依赖包列表
 
 ## 安装与运行
 
