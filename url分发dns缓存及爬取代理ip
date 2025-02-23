@@ -1,0 +1,240 @@
+import aiohttp
+import asyncio
+import random
+import time
+from aiohttp import ClientSession
+from aiohttp.client_exceptions import ClientResponseError, ClientConnectionError
+import redis
+import itertools
+import socket
+import urllib.parse
+from fake_useragent import UserAgent
+import json
+import urllib.request
+
+# ================== 代理池实现 ==================
+class ProxyPool:
+    def __init__(self):
+        self.proxies = []
+        self.last_update = 0
+        self.update_interval = 30 * 60  # 30分钟更新一次
+        self.test_url = 'http://httpbin.org/ip'  # 代理验证地址
+
+    def fetch_proxies(self):
+        """从公开代理网站爬取代理IP"""
+        target_urls = [
+            'http://www.xicidaili.com/nn/',
+            'http://www.kuaidaili.com/free/',
+            'http://www.goubanjia.com/',
+            'https://www.proxy-list.download/',
+        ]
+
+        new_proxies = []
+        for url in target_urls:
+            try:
+                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(req, timeout=10) as res:
+                    # 解析代理内容的部分
+                    proxy_list = self.parse_proxies(res.read())  # 假设 `parse_proxies` 是自定义的解析方法
+                    new_proxies.extend(proxy_list)
+            except Exception as e:
+                print(f"爬取{url}失败: {str(e)}")
+
+        # 去重处理
+        self.proxies = list({(ip, port) for ip, port in new_proxies})
+
+    def parse_proxies(self, html):
+        """解析代理列表的自定义方法"""
+        # 解析 HTML 内容，提取 IP 和端口
+        # 这里假设解析方法返回一个 IP 和端口的列表
+        return [(ip, port) for ip, port in zip(["ip1", "ip2"], ["port1", "port2"])]
+
+    def validate_proxy(self, proxy):
+        """验证代理有效性"""
+        ip, port = proxy
+        proxy_handler = urllib.request.ProxyHandler({
+            'http': f'http://{ip}:{port}',
+            'https': f'http://{ip}:{port}'
+        })
+        opener = urllib.request.build_opener(proxy_handler)
+
+        try:
+            req = urllib.request.Request(self.test_url)
+            response = opener.open(req, timeout=15)
+            if response.code == 200:
+                origin = json.loads(response.read())['origin']
+                if origin == ip:
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def update_proxies(self):
+        """更新代理池"""
+        print("开始更新代理池...")
+        self.fetch_proxies()
+        self.proxies = [p for p in self.proxies if self.validate_proxy(p)]
+        self.last_update = time.time()
+        print(f"代理池更新完成，有效代理数：{len(self.proxies)}")
+
+    def get_random_proxy(self):
+        """获取随机代理"""
+        if time.time() - self.last_update > self.update_interval or not self.proxies:
+            self.update_proxies()
+
+        if self.proxies:
+            return random.choice(self.proxies)
+        return None  # 代理池为空时返回 None
+
+
+# ================== DNS缓存实现 ==================
+class DNSCache:
+    def __init__(self):
+        self.cache = {}
+        self.ttl = 600  # 缓存有效期（秒）
+
+    def resolve(self, domain):
+        """解析域名并缓存结果"""
+        domain = self._clean_domain(domain)
+        now = time.time()
+
+        if domain in self.cache:
+            ip, expire = self.cache[domain]
+            if now < expire:
+                return ip
+
+        try:
+            # 获取IPv4地址
+            addr_info = socket.getaddrinfo(domain, None, socket.AF_INET)
+            ip = addr_info[0][4][0]
+            self.cache[domain] = (ip, now + self.ttl)
+            return ip
+        except socket.gaierror:
+            raise ValueError(f"无法解析域名: {domain}")
+
+    def _clean_domain(self, url):
+        """提取干净域名"""
+        if '://' not in url:
+            url = 'http://' + url
+        parsed = urllib.parse.urlparse(url)
+        return parsed.netloc.split(':')[0]
+
+
+# ================== URLManager类 ==================
+class URLManager:
+    def __init__(self, workers, redis_host='192.168.43.111', redis_port=6379):
+        self.r = redis.Redis(host=redis_host, port=redis_port, db=0)
+        self.workers = workers
+        self.worker_cycle = itertools.cycle(workers)
+        self.proxy_pool = ProxyPool()
+        self.dns_cache = DNSCache()
+
+    def add_url(self, url):
+        """添加 URL 并去重"""
+        if self.r.sismember('url_set', url):  # 判断 URL 是否存在
+            print(f"URL: {url} 已存在，不重复添加")
+            return False
+        self.r.sadd('url_set', url)  # 添加到 URL 集合
+        print(f"URL: {url} 已成功添加")
+        return True  # 成功添加
+
+    def get_url(self):
+        """获取一个未处理的 URL"""
+        url = self.r.spop('url_set')  # 随机取出 URL（可改成队列模式）
+        if url:
+            print(f"获取 URL: {url.decode()}")  # 注意decode，确保url为字节串
+        return url
+
+    def distribute(self, url, method='round_robin'):
+        """根据不同方式分发 URL"""
+        proxy = self.proxy_pool.get_random_proxy()
+        if proxy:
+            print(f"分配代理: {proxy[0]}:{proxy[1]} 给 URL: {url}")
+        else:
+            print(f"没有有效代理，URL: {url} 将直接处理")
+
+        ip = self.dns_cache.resolve(url)
+        print(f"域名 {url} 被解析为 IP: {ip}")
+
+        worker = next(self.worker_cycle)
+        self.r.rpush(f'task_queue:{worker}', url)
+        print(f"URL: {url} 分配给 {worker}")
+        return worker
+
+
+# ================== AsyncCrawler实现 ==================
+class AsyncCrawler:
+    def __init__(self, max_retries=3):
+        self.proxy_manager = ProxyPool()  # 代理池
+        self.max_retries = max_retries  # 最大重试次数
+        self.user_agent_list = [self.generate_user_agent() for _ in range(10)]  # 生成一系列的 User-Agent
+        self.url_manager = URLManager(workers=['worker1', 'worker2', 'worker3'])
+
+    def generate_user_agent(self):
+        """生成随机的 User-Agent"""
+        ua = UserAgent()
+        return ua.random
+
+    async def fetch(self, url: str, session: ClientSession, retries: int = 0):
+        """发送 HTTP 请求并处理异常"""
+        proxy = self.proxy_manager.get_random_proxy()  # 获取随机代理IP
+        headers = {
+            'User-Agent': random.choice(self.user_agent_list)  # 随机选择 User-Agent
+        }
+        try:
+            async with session.get(url, headers=headers, proxy=proxy) as response:
+                if response.status == 200:
+                    return await response.text()
+                elif response.status == 429 or response.status == 503:
+                    # 如果遇到 429/503 错误，稍等后重试
+                    if retries < self.max_retries:
+                        print(f"Rate limited, retrying {url}...")
+                        await asyncio.sleep(2 ** retries)  # 指数退避
+                        return await self.fetch(url, session, retries + 1)
+                    else:
+                        print(f"Failed after {self.max_retries} retries: {url}")
+                else:
+                    response.raise_for_status()  # 其他错误直接抛出
+        except (ClientResponseError, ClientConnectionError) as e:
+            print(f"Error fetching {url}: {e}")
+        return None
+
+    async def crawl(self, urls):
+        """异步爬取多个 URL"""
+        async with aiohttp.ClientSession() as session:
+            tasks = [self.fetch(url, session) for url in urls]
+            results = await asyncio.gather(*tasks)
+            return results
+
+    def start_crawl(self, urls):
+        """开始爬取并分配任务"""
+        for url in urls:
+            if self.url_manager.add_url(url):
+                self.url_manager.distribute(url)
+        loop = asyncio.get_event_loop()
+        results = loop.run_until_complete(self.crawl(urls))
+        print(results)
+
+
+# 示例使用
+if __name__ == '__main__':
+    workers = ['worker1', 'worker2', 'worker3']
+    manager = URLManager(workers)
+
+    # 清空 Redis 存储的 URL 和任务队列
+    print("清空 Redis 存储...")
+    manager.r.delete("url_set")
+    for worker in workers:
+        manager.r.delete(f"task_queue:{worker}")
+
+    print("Redis 数据清理完成，准备重新演示...\n")
+
+    # 重新演示 URL 分发
+    url_list = ["http://news.163.com/rank/", "http://example.com", "https://www.baidu.com"]
+
+    for url in url_list:
+        if manager.add_url(url):
+            assigned_worker = manager.distribute(url, method='load_balanced')
+            print(f'URL: {url} -> Assigned to: {assigned_worker}')
+        else:
+            print(f'URL: {url} 已存在，不重复添加')
